@@ -3,11 +3,8 @@ import PropTypes from 'prop-types';
 import classNames from 'classnames';
 import { useSelector } from 'react-redux';
 import { toast } from 'react-toastify';
-import axios from 'axios';
-
 import styles from './Myspace.module.css';
 import { setPlatformScheduleCount } from '../PlatformScheduleBadge';
-import { ENDPOINTS } from '../../../../utils/URL';
 
 const HEADLINE_MIN = 12;
 const HEADLINE_MAX = 95;
@@ -49,6 +46,35 @@ const STOP_WORDS = new Set([
   'with',
   'within',
 ]);
+
+const MYSPACE_SCHEDULE_STORAGE_KEY = 'hgn_myspace_schedules';
+
+const readSchedulesFromStorage = () => {
+  if (typeof window === 'undefined' || !window?.localStorage) {
+    return { data: [], error: new Error('Local storage unavailable') };
+  }
+  try {
+    const stored = window.localStorage.getItem(MYSPACE_SCHEDULE_STORAGE_KEY);
+    if (!stored) return { data: [] };
+    const parsed = JSON.parse(stored);
+    if (!Array.isArray(parsed)) return { data: [] };
+    return { data: parsed };
+  } catch (error) {
+    return { data: [], error };
+  }
+};
+
+const persistSchedulesToStorage = schedules => {
+  if (typeof window === 'undefined' || !window?.localStorage) {
+    return { success: false, error: new Error('Local storage unavailable') };
+  }
+  try {
+    window.localStorage.setItem(MYSPACE_SCHEDULE_STORAGE_KEY, JSON.stringify(schedules));
+    return { success: true };
+  } catch (error) {
+    return { success: false, error };
+  }
+};
 
 const sanitizeTags = text =>
   text
@@ -208,28 +234,44 @@ function MyspaceAutoPoster({ platform }) {
   useEffect(() => {
     if (platform !== 'myspace') return undefined;
     let isMounted = true;
-    const loadSchedules = async () => {
+
+    const loadSchedulesFromBrowser = () => {
+      if (!isMounted) return;
       setSchedulesLoading(true);
       setScheduleSyncError('');
-      try {
-        const response = await axios.get(ENDPOINTS.MYSPACE_SCHEDULES());
-        if (!isMounted) return;
-        const records = Array.isArray(response?.data?.data) ? response.data.data : [];
-        const normalized = records.map(normalizeScheduleRecord).filter(Boolean);
+      const { data, error } = readSchedulesFromStorage();
+      if (error && isMounted) {
+        setSavedSchedules([]);
+        setScheduleSyncError('Unable to load saved scheduled posts from this browser.');
+        toast.error('Unable to load saved Myspace posts. Local storage may be disabled.');
+      } else if (isMounted) {
+        const normalized = (Array.isArray(data) ? data : [])
+          .map(normalizeScheduleRecord)
+          .filter(Boolean);
         setSavedSchedules(sortSchedulesByUpdatedAt(normalized));
-      } catch (error) {
-        if (!isMounted) return;
-        setScheduleSyncError('Unable to load saved scheduled posts.');
-        toast.error('Unable to load saved Myspace posts. Please try again later.');
-      } finally {
-        if (isMounted) {
-          setSchedulesLoading(false);
-        }
+      }
+      if (isMounted) {
+        setSchedulesLoading(false);
       }
     };
-    loadSchedules();
+
+    loadSchedulesFromBrowser();
+
+    const handleStorageSync = event => {
+      if (event.key === MYSPACE_SCHEDULE_STORAGE_KEY) {
+        loadSchedulesFromBrowser();
+      }
+    };
+
+    if (typeof window !== 'undefined') {
+      window.addEventListener('storage', handleStorageSync);
+    }
+
     return () => {
       isMounted = false;
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('storage', handleStorageSync);
+      }
     };
   }, [platform]);
 
@@ -421,7 +463,7 @@ function MyspaceAutoPoster({ platform }) {
     setActiveSubTab('make');
   };
 
-  const handleSaveSchedule = async () => {
+  const handleSaveSchedule = () => {
     if (scheduleSaving) return;
     setScheduleAttemptedSave(true);
     if (!scheduleHasDraft) {
@@ -453,42 +495,34 @@ function MyspaceAutoPoster({ platform }) {
       updatedAt: new Date().toISOString(),
     });
     setScheduleSaving(true);
-    try {
-      const response = isEditing
-        ? await axios.put(ENDPOINTS.MYSPACE_SCHEDULE_BY_ID(recordId), payload)
-        : await axios.post(ENDPOINTS.MYSPACE_SCHEDULES(), payload);
-      const apiRecord = normalizeScheduleRecord(response?.data?.data) || localRecord;
-      setSavedSchedules(prev => {
-        const remaining = prev.filter(item => item.id !== apiRecord.id);
-        return sortSchedulesByUpdatedAt([apiRecord, ...remaining]);
-      });
-      const toastMessage = isEditing ? 'Scheduled post updated.' : 'Scheduled post saved.';
+    let persistSuccess = true;
+    setSavedSchedules(prev => {
+      const remaining = prev.filter(item => item.id !== localRecord.id);
+      const next = sortSchedulesByUpdatedAt([localRecord, ...remaining]);
+      const { success } = persistSchedulesToStorage(next);
+      if (!success) {
+        persistSuccess = false;
+      }
+      return next;
+    });
+    if (persistSuccess) {
+      const toastMessage = isEditing
+        ? 'Scheduled post updated locally.'
+        : 'Scheduled post saved locally.';
       toast.success(toastMessage);
-      handleReset();
-      setScheduledDraft('');
-      setScheduledDate('');
-      setScheduledTime('');
-      setScheduleAttemptedSave(false);
-      setEditingScheduleId(null);
-      setActiveSubTab('make');
-    } catch (error) {
-      setSavedSchedules(prev => {
-        const remaining = prev.filter(item => item.id !== localRecord.id);
-        return sortSchedulesByUpdatedAt([{ ...localRecord, isLocalOnly: true }, ...remaining]);
-      });
-      toast.warn(
-        'Saved locally only. It will disappear after refresh until the server save succeeds.',
-      );
-      handleReset();
-      setScheduledDraft('');
-      setScheduledDate('');
-      setScheduledTime('');
-      setScheduleAttemptedSave(false);
-      setEditingScheduleId(null);
-      setActiveSubTab('make');
-    } finally {
-      setScheduleSaving(false);
+      setScheduleSyncError('');
+    } else {
+      toast.error('Unable to save schedule in browser storage. It may disappear after refresh.');
+      setScheduleSyncError('Unable to sync schedules to browser storage.');
     }
+    handleReset();
+    setScheduledDraft('');
+    setScheduledDate('');
+    setScheduledTime('');
+    setScheduleAttemptedSave(false);
+    setEditingScheduleId(null);
+    setActiveSubTab('make');
+    setScheduleSaving(false);
   };
 
   const handleEditSchedule = scheduleId => {
@@ -1002,7 +1036,8 @@ function MyspaceAutoPoster({ platform }) {
           <section className={classNames(styles['myspace-card'], styles['myspace-card--saved'])}>
             <h3>Saved scheduled posts</h3>
             <p className={styles['myspace-field__hint']}>
-              Choose a saved entry to continue editing or submit it to Myspace.
+              Choose a saved entry to continue editing or submit it to Myspace. These are stored
+              locally in this browser.
             </p>
             {schedulesLoading && (
               <p className={styles['myspace-field__hint']}>Loading saved scheduled posts…</p>
@@ -1038,11 +1073,6 @@ function MyspaceAutoPoster({ platform }) {
                         </span>
                       </div>
                       <p className={styles['myspace-saved__excerpt']}>{excerpt}</p>
-                      {schedule.isLocalOnly && (
-                        <p className={styles['myspace-field__error']}>
-                          Not synced yet. This entry will disappear after refresh.
-                        </p>
-                      )}
                       <div className={styles['myspace-saved__actions']}>
                         <button
                           type="button"
